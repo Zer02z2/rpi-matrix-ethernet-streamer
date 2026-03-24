@@ -4,6 +4,10 @@ displayer/main.py
 Receives JPEG frames from receiver/main.py over TCP and displays them
 on an RGB LED matrix.
 
+Decoupled architecture:
+  - Receiver thread: pulls frames from TCP, stores latest in FrameStore
+  - Display loop (main thread): swaps on vsync at matrix rate, always shows latest frame
+
 Run with Python 3.11+:
     sudo python main.py [--port 9002] [--led-*]
 
@@ -16,6 +20,7 @@ import argparse
 import io
 import socket
 import struct
+import threading
 import time
 
 from PIL import Image
@@ -29,7 +34,36 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# FrameStore — single-slot, latest frame wins
+# ---------------------------------------------------------------------------
+
+class FrameStore:
+    def __init__(self):
+        self._lock  = threading.Condition(threading.Lock())
+        self._frame = None
+        self._seq   = 0
+
+    def put(self, img: Image.Image) -> None:
+        with self._lock:
+            self._frame = img
+            self._seq  += 1
+            self._lock.notify_all()
+
+    def get_latest(self, last_seq: int, timeout: float = 1.0):
+        """Block until a frame newer than last_seq is available.
+        Returns (seq, Image) or None on timeout."""
+        with self._lock:
+            deadline = time.monotonic() + timeout
+            while self._seq <= last_seq or self._frame is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._lock.wait(timeout=remaining)
+            return self._seq, self._frame
+
+
+# ---------------------------------------------------------------------------
+# Receiver thread — pulls JPEG frames from TCP, decodes, stores in FrameStore
 # ---------------------------------------------------------------------------
 
 def _recvall(sock: socket.socket, n: int) -> bytes | None:
@@ -42,26 +76,37 @@ def _recvall(sock: socket.socket, n: int) -> bytes | None:
     return buf
 
 
-def iter_frames(port: int):
-    """Yields PIL Images from receiver's TCP stream."""
-    while True:
-        try:
-            print(f"Connecting to receiver on port {port}...")
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect(("127.0.0.1", port))
-                print("Connected.")
-                while True:
-                    raw = _recvall(s, 4)
-                    if not raw:
-                        break
-                    length = struct.unpack(">I", raw)[0]
-                    jpeg   = _recvall(s, length)
-                    if not jpeg:
-                        break
-                    yield Image.open(io.BytesIO(jpeg)).convert("RGB")
-        except Exception as e:
-            print(f"Connection lost: {e} — retrying in 2s...")
-            time.sleep(2)
+class ReceiverThread(threading.Thread):
+    def __init__(self, port: int, store: FrameStore,
+                 matrix_w: int, matrix_h: int, shutdown: threading.Event):
+        super().__init__(name="Receiver", daemon=True)
+        self.port     = port
+        self.store    = store
+        self.matrix_w = matrix_w
+        self.matrix_h = matrix_h
+        self.shutdown = shutdown
+
+    def run(self):
+        while not self.shutdown.is_set():
+            try:
+                print(f"Connecting to receiver on port {self.port}...")
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.connect(("127.0.0.1", self.port))
+                    print("Connected.")
+                    while not self.shutdown.is_set():
+                        raw = _recvall(s, 4)
+                        if not raw:
+                            break
+                        length = struct.unpack(">I", raw)[0]
+                        jpeg   = _recvall(s, length)
+                        if not jpeg:
+                            break
+                        img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+                        img = img.resize((self.matrix_w, self.matrix_h), Image.LANCZOS)
+                        self.store.put(img)
+            except Exception as e:
+                print(f"Connection lost: {e} — retrying in 2s...")
+                time.sleep(2)
 
 
 # ---------------------------------------------------------------------------
@@ -116,17 +161,31 @@ def main():
     matrix_h = matrix.height
     print(f"Matrix: {matrix_w}x{matrix_h}")
 
-    canvas = matrix.CreateFrameCanvas()
+    shutdown = threading.Event()
+    store    = FrameStore()
+
+    receiver = ReceiverThread(args.port, store, matrix_w, matrix_h, shutdown)
+    receiver.start()
+
+    canvas   = matrix.CreateFrameCanvas()
+    last_seq = 0
 
     try:
-        for img in iter_frames(args.port):
-            img = img.resize((matrix_w, matrix_h), Image.LANCZOS)
+        while True:
+            result = store.get_latest(last_seq, timeout=1.0)
+            if result is None:
+                continue  # no new frame — vsync loop will just hold last frame
+            last_seq, img = result
+
             canvas.SetImage(img)
             canvas = matrix.SwapOnVSync(canvas)
             canvas.SetImage(img)
+
             if _notifier:
                 _notifier.notify("WATCHDOG=1")
+
     except KeyboardInterrupt:
+        shutdown.set()
         matrix.Clear()
         print("\nShutting down.")
 
