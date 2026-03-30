@@ -77,9 +77,10 @@ def _recvall(sock: socket.socket, n: int) -> bytes | None:
 
 
 class ReceiverThread(threading.Thread):
-    def __init__(self, port: int, store: FrameStore,
+    def __init__(self, host: str, port: int, store: FrameStore,
                  matrix_w: int, matrix_h: int, shutdown: threading.Event):
         super().__init__(name="Receiver", daemon=True)
+        self.host     = host
         self.port     = port
         self.store    = store
         self.matrix_w = matrix_w
@@ -89,9 +90,9 @@ class ReceiverThread(threading.Thread):
     def run(self):
         while not self.shutdown.is_set():
             try:
-                print(f"Connecting to receiver on port {self.port}...")
+                print(f"Connecting to {self.host}:{self.port}...")
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.connect(("127.0.0.1", self.port))
+                    s.connect((self.host, self.port))
                     print("Connected.")
                     while not self.shutdown.is_set():
                         raw = _recvall(s, 4)
@@ -116,6 +117,8 @@ class ReceiverThread(threading.Thread):
 def parse_args():
     parser = argparse.ArgumentParser(description="RGB Matrix display — JPEG frames via TCP.")
 
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Host to connect to (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=9002)
 
     parser.add_argument("--led-rows",                type=int,  default=64)
@@ -129,7 +132,9 @@ def parse_args():
     parser.add_argument("--led-brightness",          type=int,  default=100, dest="led_brightness")
     parser.add_argument("--led-hardware-mapping",    default="regular",      dest="led_hardware_mapping")
     parser.add_argument("--led-pixel-mapper",        default="",             dest="led_pixel_mapper")
-    parser.add_argument("--led-show-refresh",        action="store_true", default=False, dest="led_show_refresh")
+    parser.add_argument("--led-show-refresh",         action="store_true", default=False, dest="led_show_refresh")
+    parser.add_argument("--led-limit-refresh",        type=int, default=0, dest="led_limit_refresh",
+                        help="Limit refresh rate in Hz, 0 = no limit (default: 0)")
 
     return parser.parse_args()
 
@@ -154,6 +159,7 @@ def main():
     options.hardware_mapping    = args.led_hardware_mapping
     options.pixel_mapper_config = args.led_pixel_mapper
     options.show_refresh_rate   = args.led_show_refresh
+    options.limit_refresh_rate_hz = args.led_limit_refresh
     options.drop_privileges     = False
 
     matrix   = RGBMatrix(options=options)
@@ -164,7 +170,7 @@ def main():
     shutdown = threading.Event()
     store    = FrameStore()
 
-    receiver = ReceiverThread(args.port, store, matrix_w, matrix_h, shutdown)
+    receiver = ReceiverThread(args.host, args.port, store, matrix_w, matrix_h, shutdown)
     receiver.start()
 
     canvas   = matrix.CreateFrameCanvas()
