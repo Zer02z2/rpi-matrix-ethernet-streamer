@@ -23,7 +23,7 @@ import numpy as np
 import NDIlib as ndi
 from pynput import mouse as pynput_mouse
 
-NDI_OUTPUT_SIZE = 480  # width × height sent over NDI (square)
+NDI_OUTPUT_SIZE_DEFAULT = 480  # width × height sent over NDI (square)
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +72,12 @@ def parse_args() -> argparse.Namespace:
              "(default: 0.5 — e.g. half of a 1080p screen = 540×540 px)"
     )
     parser.add_argument(
+        "--ndi-output-size", type=int, default=NDI_OUTPUT_SIZE_DEFAULT,
+        metavar="PIXELS",
+        help="Width and height of the square NDI output frame in pixels "
+             f"(default: {NDI_OUTPUT_SIZE_DEFAULT})"
+    )
+    parser.add_argument(
         "--fps", type=int, default=30,
         help="Target send rate in frames per second (default: 30)"
     )
@@ -110,9 +116,10 @@ def main() -> None:
         raise SystemExit(1)
 
     video_frame = ndi.VideoFrameV2()
+    ndi_output_size = args.ndi_output_size
     video_frame.FourCC = ndi.FOURCC_VIDEO_TYPE_BGRX
-    video_frame.xres = NDI_OUTPUT_SIZE
-    video_frame.yres = NDI_OUTPUT_SIZE
+    video_frame.xres = ndi_output_size
+    video_frame.yres = ndi_output_size
 
     log.info("NDI source '%s' created — visible on the local network.", args.ndi_name)
 
@@ -137,7 +144,7 @@ def main() -> None:
             "Primary monitor: %dx%d | Capture region: %dx%d px → NDI output: %dx%d px | FPS: %d",
             monitor["width"], monitor["height"],
             capture_size, capture_size,
-            NDI_OUTPUT_SIZE, NDI_OUTPUT_SIZE,
+            ndi_output_size, ndi_output_size,
             args.fps,
         )
 
@@ -160,10 +167,10 @@ def main() -> None:
 
             # 5. Resize to NDI output resolution on the Mac
             #    (reduces NDI bandwidth and Pi decode work)
-            if img.shape[:2] != (NDI_OUTPUT_SIZE, NDI_OUTPUT_SIZE):
+            if img.shape[:2] != (ndi_output_size, ndi_output_size):
                 img = cv2.resize(
                     img,
-                    (NDI_OUTPUT_SIZE, NDI_OUTPUT_SIZE),
+                    (ndi_output_size, ndi_output_size),
                     interpolation=cv2.INTER_LINEAR,
                 )
 
