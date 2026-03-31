@@ -1,0 +1,4 @@
+ndi-python
+numpy
+opencv-python
+pillow

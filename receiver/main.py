@@ -1,21 +1,27 @@
 """
 receiver/main.py
 
-Receives NDI video from the Mac sender and serves JPEG frames over TCP
-to displayer/main.py running on the same Pi.
+Receives NDI video from the Mac sender and broadcasts JPEG frames over
+UDP multicast to all listeners on the local Pi (displayer, fpp_bridge, etc.).
 
-Run with Python 3.9:
-    LC_ALL=C.UTF-8 python main.py [--ndi-name ScreenCapture] [--port 9002]
+Pipeline:
+  Mac sender/main.py  ──NDI──►  receiver/main.py  ──UDP multicast──►  displayer/main.py
+                                                                    └──►  colorlight/fpp_bridge.py
+
+Fragment protocol (12-byte header per datagram):
+  frame_id(4)  frag_idx(2)  frag_total(2)  frame_size(4)  [payload]
+
+Run with Python 3.9+:
+    python main.py [--ndi-name ScreenCapture] [--mcast-group 239.0.0.1] [--port 9002]
 
 Dependencies:
     pip install ndi-python numpy opencv-python pillow
-    avahi-daemon must be running.
+    avahi-daemon must be running for NDI discovery.
 """
 
 import argparse
 import io
 import logging
-import os
 import signal
 import socket
 import struct
@@ -27,7 +33,25 @@ import numpy as np
 import NDIlib as ndi
 from PIL import Image
 
-SOCKET_PATH = "/tmp/matrix_frames.sock"
+# ---------------------------------------------------------------------------
+# Fragment protocol
+# ---------------------------------------------------------------------------
+
+_FRAG_HDR_FMT  = ">IHHI"   # frame_id(4) frag_idx(2) frag_total(2) frame_size(4)
+_FRAG_HDR_LEN  = struct.calcsize(_FRAG_HDR_FMT)   # 12 bytes
+_CHUNK_SIZE    = 60_000    # bytes of JPEG data per datagram (safe for loopback)
+
+
+def fragment(jpeg_bytes: bytes, frame_id: int) -> list:
+    """Split jpeg_bytes into UDP datagrams with fragment headers."""
+    total = len(jpeg_bytes)
+    chunks = [jpeg_bytes[i: i + _CHUNK_SIZE] for i in range(0, total, _CHUNK_SIZE)]
+    frag_total = len(chunks)
+    pkts = []
+    for idx, chunk in enumerate(chunks):
+        hdr = struct.pack(_FRAG_HDR_FMT, frame_id, idx, frag_total, total)
+        pkts.append(hdr + chunk)
+    return pkts
 
 
 # ---------------------------------------------------------------------------
@@ -95,12 +119,11 @@ class NDIReceiver(threading.Thread):
         while source is None and not self.shutdown.is_set():
             ndi.find_wait_for_sources(finder, 1000)
             sources = ndi.find_get_current_sources(finder)
-            for i, s in enumerate(sources):
+            for s in sources:
                 try:
-                    name = s.ndi_name
-                    if self.ndi_name.lower() in name.lower():
+                    if self.ndi_name.lower() in s.ndi_name.lower():
                         source = s
-                        log.info("Matched: %s", name)
+                        log.info("Matched: %s", s.ndi_name)
                         break
                 except Exception:
                     pass
@@ -143,36 +166,44 @@ class NDIReceiver(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
-# TCP client handler
+# UDP multicast sender
 # ---------------------------------------------------------------------------
 
-class ClientHandler(threading.Thread):
-    def __init__(self, conn: socket.socket, addr, store: FrameStore,
-                 shutdown: threading.Event):
-        super().__init__(name=f"Client-{addr}", daemon=True)
-        self.conn     = conn
-        self.addr     = addr
-        self.store    = store
-        self.shutdown = shutdown
+class UDPSender(threading.Thread):
+    def __init__(self, mcast_group: str, port: int,
+                 store: FrameStore, shutdown: threading.Event):
+        super().__init__(name="UDPSender", daemon=True)
+        self.mcast_group = mcast_group
+        self.port        = port
+        self.store       = store
+        self.shutdown    = shutdown
 
     def run(self):
         log = logging.getLogger(self.name)
-        log.info("Connected: %s", self.addr)
-        self.conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        last_seq = 0
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Enable loopback so processes on the same host receive their own multicast
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+        # TTL 1 keeps multicast local to the machine / single subnet
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+        log.info("UDP multicast sender → %s:%d", self.mcast_group, self.port)
+
+        last_seq  = 0
+        frame_id  = 0
+        dest      = (self.mcast_group, self.port)
         try:
             while not self.shutdown.is_set():
                 result = self.store.get_latest(last_seq, timeout=1.0)
                 if result is None:
                     continue
                 last_seq, jpeg_bytes = result
-                try:
-                    self.conn.sendall(struct.pack(">I", len(jpeg_bytes)) + jpeg_bytes)
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    break
+                for pkt in fragment(jpeg_bytes, frame_id):
+                    sock.sendto(pkt, dest)
+                log.debug("Frame %d sent | %d bytes | %d fragment(s)",
+                          frame_id, len(jpeg_bytes),
+                          -(-len(jpeg_bytes) // _CHUNK_SIZE))
+                frame_id = (frame_id + 1) & 0xFFFFFFFF
         finally:
-            self.conn.close()
-            log.info("Disconnected: %s", self.addr)
+            sock.close()
 
 
 # ---------------------------------------------------------------------------
@@ -180,11 +211,18 @@ class ClientHandler(threading.Thread):
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="NDI receiver → TCP JPEG server.")
-    parser.add_argument("--ndi-name", default="ScreenCapture")
-    parser.add_argument("--port", type=int, default=9002)
-    parser.add_argument("--quality", type=int, default=85)
-    parser.add_argument("--log-level", default="INFO",
+    parser = argparse.ArgumentParser(
+        description="NDI receiver → UDP multicast JPEG broadcaster."
+    )
+    parser.add_argument("--ndi-name",    default="ScreenCapture",
+                        help="NDI source name to search for (default: ScreenCapture)")
+    parser.add_argument("--mcast-group", default="239.0.0.1",
+                        help="UDP multicast group address (default: 239.0.0.1)")
+    parser.add_argument("--port",        type=int, default=9002,
+                        help="UDP port (default: 9002)")
+    parser.add_argument("--quality",     type=int, default=85,
+                        help="JPEG compression quality 1-95 (default: 85)")
+    parser.add_argument("--log-level",   default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
 
@@ -216,23 +254,12 @@ def main():
 
     store    = FrameStore()
     receiver = NDIReceiver(args.ndi_name, store, shutdown, args.quality)
+    sender   = UDPSender(args.mcast_group, args.port, store, shutdown)
+
     receiver.start()
+    sender.start()
+    shutdown.wait()
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", args.port))
-    server.listen(4)
-    server.settimeout(1.0)
-    log.info("TCP server listening on 127.0.0.1:%d", args.port)
-
-    while not shutdown.is_set():
-        try:
-            conn, addr = server.accept()
-            ClientHandler(conn, addr, store, shutdown).start()
-        except socket.timeout:
-            continue
-
-    server.close()
     ndi.destroy()
     log.info("Stopped.")
 
