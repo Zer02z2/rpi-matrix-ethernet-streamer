@@ -1,118 +1,76 @@
 """
 receiver/colorlight_test.py
 
-Tries several known Colorlight 5A-75B packet header formats in sequence.
-Each format sends a different solid color — whichever one lights up the
-display tells us which header format is correct.
+Standalone protocol test for the Colorlight 5A-75B.
+First restores the red channel damaged by the previous incorrect test,
+then sends solid color frames to verify the correct protocol works.
 
 Run as root:
     sudo python colorlight_test.py [--interface eth1] [--width 192] [--height 192]
 """
 
 import argparse
-import select
 import socket
-import struct
 import time
 
 # ---------------------------------------------------------------------------
-# Ethernet constants
+# Constants
 # ---------------------------------------------------------------------------
 
-DST_MAC    = bytes.fromhex('112233445566')
-SRC_MAC    = bytes.fromhex('222233445566')
-ETHERTYPE  = bytes([0x01, 0x07])
-ETH_HDR    = DST_MAC + SRC_MAC + ETHERTYPE   # 14 bytes
+DST_MAC = bytes.fromhex('112233445566')
+SRC_MAC = bytes.fromhex('222233445566')
 
-ETH_MIN_PAYLOAD = 46   # minimum payload for a 60-byte Ethernet frame
-
-
-def pad(payload: bytes) -> bytes:
-    """Pad payload to Ethernet minimum if needed."""
-    if len(payload) < ETH_MIN_PAYLOAD:
-        return payload + b'\x00' * (ETH_MIN_PAYLOAD - len(payload))
-    return payload
-
-
-# ---------------------------------------------------------------------------
-# Brightness / config packet — sent once before each frame
-# (22-byte payload, brightness at byte 21)
-# ---------------------------------------------------------------------------
-
-def brightness_packet(brightness: int = 0xFF) -> bytes:
-    payload = bytearray(max(22, ETH_MIN_PAYLOAD))
-    payload[21] = brightness
-    return ETH_HDR + bytes(payload)
-
-
-# ---------------------------------------------------------------------------
-# Row packet header formats to try
-# Each lambda returns a 7-byte header given (row_index, pixel_count)
-# ---------------------------------------------------------------------------
-
-FORMATS = {
-
-    "A  cmd=0x05, reserved, row, width": lambda row, w:
-        struct.pack('>BBBHH', 0x05, 0x00, 0x00, row, w),
-
-    "B  row, width, zeros": lambda row, w:
-        struct.pack('>HH', row, w) + b'\x00\x00\x00',
-
-    "C  row, byte_count, zeros": lambda row, w:
-        struct.pack('>HH', row, w * 3) + b'\x00\x00\x00',
-
-    "D  row, zeros, width, zero": lambda row, w:
-        struct.pack('>H', row) + b'\x00\x00' + struct.pack('>H', w) + b'\x00',
-
-    "E  zeros, row, zeros": lambda row, w:
-        b'\x00\x00' + struct.pack('>H', row) + b'\x00\x00\x00',
-
-    "F  row only, rest zeros": lambda row, w:
-        struct.pack('>H', row) + b'\x00\x00\x00\x00\x00',
-
-}
-
-# Solid colors in BGR order: (B, G, R)
-COLORS = [
-    (0,   0,   255),   # red
-    (0,   255, 0),     # green
-    (255, 0,   0),     # blue
-    (0,   255, 255),   # yellow
-    (255, 0,   255),   # magenta
-    (255, 255, 0),     # cyan
+BRIGHTNESS_MAP = [
+    (0,   0x00), (1,  0x03), (2,  0x05), (4,  0x0a),
+    (5,   0x0d), (6,  0x0f), (10, 0x1a), (25, 0x40),
+    (50,  0x80), (75, 0xbf), (100, 0xff),
 ]
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def recv_all(sock: socket.socket, timeout: float = 0.4) -> list:
-    """Collect any frames the card sends back within timeout seconds."""
-    out = []
-    deadline = time.monotonic() + timeout
-    while True:
-        rem = deadline - time.monotonic()
-        if rem <= 0:
-            break
-        r, _, _ = select.select([sock], [], [], rem)
-        if not r:
-            break
-        data = sock.recv(65536)
-        if data[6:12] != SRC_MAC:   # ignore our own frames
-            out.append(data)
-    return out
+def hw_brightness(pct: int) -> int:
+    val = 0x00
+    for threshold, v in BRIGHTNESS_MAP:
+        if pct >= threshold:
+            val = v
+    return val
 
 
-def send_frame(sock, width, height, header_fn, color_bgr):
-    """Send brightness packet + all rows using the given header format."""
-    sock.send(brightness_packet(0xFF))
+def brightness_packet(pct: int) -> bytes:
+    hw      = hw_brightness(pct)
+    eth     = DST_MAC + SRC_MAC + bytes([0x0a, hw])
+    payload = bytearray(63)
+    payload[0] = hw
+    payload[1] = hw
+    payload[2] = 0xFF
+    return eth + bytes(payload)
 
+
+def row_packet(row: int, bgr_row: bytes, width: int) -> bytes:
+    eth    = DST_MAC + SRC_MAC + bytes([0x55, 0x00])
+    header = bytes([row, 0x00, 0x00, width >> 8, width & 0xFF, 0x08, 0x88])
+    return eth + header + bgr_row
+
+
+def latch_packet(pct: int) -> bytes:
+    eth     = DST_MAC + SRC_MAC + bytes([0x01, 0x07])
+    payload = bytearray(98)
+    payload[21] = pct
+    payload[22] = 5
+    payload[24] = pct
+    payload[25] = pct
+    payload[26] = pct
+    return eth + bytes(payload)
+
+
+def send_solid(sock, width: int, height: int, pct: int, color_bgr: tuple):
     b, g, r = color_bgr
     row_data = bytes([b, g, r] * width)
+
+    sock.send(brightness_packet(pct))
     for row in range(height):
-        header = header_fn(row, width)
-        sock.send(ETH_HDR + header + row_data)
+        sock.send(row_packet(row, row_data, width))
+    time.sleep(0.001)
+    sock.send(latch_packet(pct))
 
 
 # ---------------------------------------------------------------------------
@@ -121,51 +79,48 @@ def send_frame(sock, width, height, header_fn, color_bgr):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--interface", default="eth1")
-    p.add_argument("--width",     type=int, default=192)
-    p.add_argument("--height",    type=int, default=192)
+    p.add_argument("--interface",  default="eth1")
+    p.add_argument("--width",      type=int, default=192)
+    p.add_argument("--height",     type=int, default=192)
+    p.add_argument("--brightness", type=int, default=50,
+                   help="Brightness percent 0-100 (default: 50)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    w, h = args.width, args.height
-    print(f"Interface: {args.interface}  |  {w}x{h}\n")
-    print("Each format sends a different color. Watch the display.")
-    print("Note which color appears — that tells us which format is correct.\n")
+    w, h, pct = args.width, args.height, args.brightness
+    print(f"Interface: {args.interface}  |  {w}x{h}  |  brightness={pct}%\n")
 
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
     sock.bind((args.interface, 0))
 
-    for (fmt_name, header_fn), color in zip(FORMATS.items(), COLORS):
-        b, g, r = color
-        color_name = {
-            (0,0,255):   "RED",
-            (0,255,0):   "GREEN",
-            (255,0,0):   "BLUE",
-            (0,255,255): "YELLOW",
-            (255,0,255): "MAGENTA",
-            (255,255,0): "CYAN",
-        }.get(color, str(color))
+    # --- Step 1: Restore red channel ---
+    # The previous test sent a malformed latch packet that zeroed out
+    # color calibration. Send a correct latch packet to fix it.
+    print("Step 1: Restoring color calibration (fixing red channel)...")
+    correct_latch = latch_packet(pct)
+    sock.send(correct_latch)
+    time.sleep(0.1)
+    print("  Done. Red should be restored now.\n")
 
-        print(f"Format {fmt_name}")
-        print(f"  Sending solid {color_name} ...")
-        send_frame(sock, w, h, header_fn, color)
+    # --- Step 2: Solid color tests ---
+    tests = [
+        ("RED",     (0,   0,   255)),
+        ("GREEN",   (0,   255, 0  )),
+        ("BLUE",    (255, 0,   0  )),
+        ("WHITE",   (255, 255, 255)),
+        ("BLACK",   (0,   0,   0  )),
+    ]
 
-        responses = recv_all(sock, timeout=0.5)
-        if responses:
-            for resp in responses:
-                hex_str = resp[:32].hex(' ')
-                print(f"  Card responded: {hex_str}{'...' if len(resp) > 32 else ''}")
-        else:
-            print(f"  No response from card.")
-
-        print(f"  >>> Does the display show solid {color_name}? (wait 2 seconds)")
+    for name, color in tests:
+        print(f"Step 2: Sending solid {name} ...")
+        send_solid(sock, w, h, pct, color)
+        print(f"  >>> Does the display show solid {name}?")
         time.sleep(2)
-        print()
 
     sock.close()
-    print("Done. Report which color (if any) appeared on the display.")
+    print("\nDone.")
 
 
 if __name__ == "__main__":

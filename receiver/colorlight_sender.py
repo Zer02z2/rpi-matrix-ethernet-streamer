@@ -5,19 +5,16 @@ Receives JPEG frames from receiver/main.py over UDP multicast and sends
 them directly to a Colorlight 5A-75B LED receiver card via raw Ethernet
 (Layer 2). No IP address, no FPP required.
 
-Pipeline:
-  receiver/main.py ──UDP multicast──► colorlight_sender.py ──raw Ethernet 0x0107──► Colorlight 5A-75B
+Protocol (3 EtherTypes per frame):
+  0x0a00+brt  Brightness packet   — sent first
+  0x5500      Row pixel data      — one packet per row, BGR order
+  0x0107      Latch/display       — sent last to flip the display buffer
 
-Protocol details:
-  - Pure Layer 2 — no IP, no UDP, no TCP
-  - Destination MAC: 11:22:33:44:55:66 (hardcoded in card firmware)
-  - Source MAC:      22:22:33:44:55:66 (hardcoded)
-  - EtherType:       0x0107 (image data)
-  - Pixel byte order: BGR (not RGB)
-  - One brightness packet per frame, followed by one Ethernet frame per row
+Credit: protocol reverse-engineered by haraldkubota
+        https://github.com/haraldkubota/colorlight
 
 Usage (root required for raw socket):
-    sudo python colorlight_sender.py [--interface eth1] [--width 192] [--height 192]
+    sudo python colorlight_sender.py [--interface eth1] [--width 192] [--height 192] [--brightness 50]
 
 Dependencies: see requirements.txt
 """
@@ -44,42 +41,73 @@ _FRAG_HDR_LEN = struct.calcsize(_FRAG_HDR_FMT)   # 12 bytes
 # Colorlight L2 protocol
 # ---------------------------------------------------------------------------
 
-_DST_MAC   = bytes.fromhex('112233445566')
-_SRC_MAC   = bytes.fromhex('222233445566')
-_ETHERTYPE = bytes([0x01, 0x07])
-_ETH_HDR   = _DST_MAC + _SRC_MAC + _ETHERTYPE   # 14 bytes
+_DST_MAC = bytes.fromhex('112233445566')
+_SRC_MAC = bytes.fromhex('222233445566')
+
+# Brightness percent → hardware value (from haraldkubota reference)
+_BRIGHTNESS_MAP = [
+    (0,   0x00), (1,  0x03), (2,  0x05), (4,  0x0a),
+    (5,   0x0d), (6,  0x0f), (10, 0x1a), (25, 0x40),
+    (50,  0x80), (75, 0xbf), (100, 0xff),
+]
 
 
-def _brightness_packet(brightness: int) -> bytes:
+def _hw_brightness(pct: int) -> int:
+    """Convert brightness percent (0-100) to hardware value (0-255)."""
+    val = 0x00
+    for threshold, v in _BRIGHTNESS_MAP:
+        if pct >= threshold:
+            val = v
+    return val
+
+
+def _brightness_packet(pct: int) -> bytes:
     """
-    Setup packet sent once before each frame's row data.
-    Payload is 22 bytes; brightness sits at payload byte 21
-    (= full-frame byte 35).
+    EtherType = 0x0a00 + hw_brightness.
+    63-byte payload: [hw_brt, hw_brt, 0xFF, 0, 0, ...]
     """
-    payload = bytearray(22)
-    payload[21] = brightness & 0xFF
-    return _ETH_HDR + bytes(payload)
+    hw  = _hw_brightness(pct)
+    eth = _DST_MAC + _SRC_MAC + bytes([0x0a, hw])
+    payload = bytearray(63)
+    payload[0] = hw
+    payload[1] = hw
+    payload[2] = 0xFF
+    return eth + bytes(payload)
 
 
 def _row_packet(row: int, bgr_row: bytes, width: int) -> bytes:
     """
-    One Ethernet frame per row of pixels.
-
-    Payload layout:
-      [0]      command byte  (0x05 = write row)
-      [1-2]    reserved
-      [3-4]    row index     (uint16 big-endian)
-      [5-6]    pixel count   (uint16 big-endian)
-      [7+]     BGR pixel data (width × 3 bytes)
+    EtherType = 0x5500.
+    7-byte header: [row, 0, 0, width_hi, width_lo, 0x08, 0x88]
+    Followed by BGR pixel data (width × 3 bytes).
     """
-    header = struct.pack('>BBBHH',
-        0x05,   # command: write pixel row
-        0x00,   # reserved
-        0x00,   # reserved
-        row,    # row index (0-based)
-        width,  # pixels in this row
-    )
-    return _ETH_HDR + header + bgr_row
+    eth    = _DST_MAC + _SRC_MAC + bytes([0x55, 0x00])
+    header = bytes([
+        row,
+        0x00,
+        0x00,
+        width >> 8,
+        width & 0xFF,
+        0x08,
+        0x88,
+    ])
+    return eth + header + bgr_row
+
+
+def _latch_packet(pct: int) -> bytes:
+    """
+    EtherType = 0x0107.
+    98-byte payload with color calibration at specific offsets.
+    Flips the display buffer — must be sent after all row packets.
+    """
+    eth     = _DST_MAC + _SRC_MAC + bytes([0x01, 0x07])
+    payload = bytearray(98)
+    payload[21] = pct
+    payload[22] = 5
+    payload[24] = pct
+    payload[25] = pct
+    payload[26] = pct
+    return eth + bytes(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -180,22 +208,22 @@ class ColorlightSender(threading.Thread):
         self.interface  = interface
         self.width      = width
         self.height     = height
-        self.brightness = brightness
+        self.brightness = brightness   # 0-100 percent
         self.store      = store
         self.shutdown   = shutdown
 
     def run(self):
         log = logging.getLogger(self.name)
 
-        # AF_PACKET + SOCK_RAW = raw Layer-2 socket; requires root
         sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
         sock.bind((self.interface, 0))
-        log.info("Raw L2 socket bound to %s | display=%dx%d | brightness=%d",
+        log.info("Raw L2 socket bound to %s | display=%dx%d | brightness=%d%%",
                  self.interface, self.width, self.height, self.brightness)
 
-        brightness_pkt = _brightness_packet(self.brightness)
-        row_stride     = self.width * 3   # bytes per row (3 channels)
-        last_seq       = 0
+        brt_pkt   = _brightness_packet(self.brightness)
+        latch_pkt = _latch_packet(self.brightness)
+        row_stride = self.width * 3
+        last_seq   = 0
 
         try:
             while not self.shutdown.is_set():
@@ -208,19 +236,27 @@ class ColorlightSender(threading.Thread):
                     img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
                     if img.size != (self.width, self.height):
                         img = img.resize((self.width, self.height), Image.LANCZOS)
-                    # Colorlight expects BGR, not RGB
+                    # Colorlight expects BGR
                     r, g, b = img.split()
                     bgr_bytes = Image.merge("RGB", (b, g, r)).tobytes()
                 except Exception as exc:
                     log.warning("Frame decode error: %s", exc)
                     continue
 
-                sock.send(brightness_pkt)
+                # 1. Brightness
+                sock.send(brt_pkt)
+
+                # 2. Row data
                 for row in range(self.height):
                     row_data = bgr_bytes[row * row_stride: (row + 1) * row_stride]
                     sock.send(_row_packet(row, row_data, self.width))
 
-                log.debug("Frame sent | seq=%d | %d rows", last_seq, self.height)
+                # 3. Small delay then latch (haraldkubota notes this prevents
+                #    flickering on the last row module)
+                time.sleep(0.001)
+                sock.send(latch_pkt)
+
+                log.debug("Frame sent | seq=%d", last_seq)
         finally:
             sock.close()
 
@@ -233,18 +269,14 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="UDP multicast → raw Ethernet → Colorlight 5A-75B (no IP, no FPP)"
     )
-    parser.add_argument("--mcast-group", default="239.0.0.1",
-                        help="UDP multicast group to join (default: 239.0.0.1)")
-    parser.add_argument("--port",        type=int, default=9002,
-                        help="UDP port (default: 9002)")
+    parser.add_argument("--mcast-group", default="239.0.0.1")
+    parser.add_argument("--port",        type=int, default=9002)
     parser.add_argument("--interface",   default="eth1",
                         help="Interface connected to Colorlight card (default: eth1)")
-    parser.add_argument("--width",       type=int, default=192,
-                        help="Display width in pixels (default: 192)")
-    parser.add_argument("--height",      type=int, default=192,
-                        help="Display height in pixels (default: 192)")
-    parser.add_argument("--brightness",  type=int, default=255,
-                        help="Brightness 0-255 (default: 255)")
+    parser.add_argument("--width",       type=int, default=192)
+    parser.add_argument("--height",      type=int, default=192)
+    parser.add_argument("--brightness",  type=int, default=50,
+                        help="Brightness 0-100 percent (default: 50)")
     parser.add_argument("--log-level",   default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
@@ -262,8 +294,9 @@ def main():
         datefmt="%H:%M:%S",
     )
     log = logging.getLogger("main")
-    log.info("colorlight_sender | mcast=%s:%d | interface=%s | display=%dx%d",
-             args.mcast_group, args.port, args.interface, args.width, args.height)
+    log.info("colorlight_sender | mcast=%s:%d | interface=%s | display=%dx%d | brightness=%d%%",
+             args.mcast_group, args.port, args.interface,
+             args.width, args.height, args.brightness)
 
     shutdown = threading.Event()
 
